@@ -1,0 +1,314 @@
+#!/bin/sh
+# nb3-staticip — IP fija para salas sin DHCP. Viene en nb3-staticip.cpio, un
+# initrd extra que el grub.cfg carga después de initrd.img; lo instala
+# nb3-staticip-usb.py.
+#
+# Corre en init-premount: después del udev (teclado y placas de red ya
+# existen) y antes del mountroot del nutellaboot. Toma la IP de static-ip.conf
+# (en la FAT del pendrive, por la MAC de la placa cableada) o la pregunta en
+# la consola, y la deja en IP= de /conf/param.conf, que el /init relee después
+# de cada script. El configure_networking del nutellaboot la usa en lugar del
+# DHCP, y el nb_net_reset la restaura en cada intento. Para el sistema final
+# deja los datos en $NB_RUN/static-ip (lo lee el 81-nm-static.sh del stuff).
+#
+# Sin nbgw= en la línea del kernel, o con un ip= ya puesto, no hace nada.
+
+PREREQ="udev"
+prereqs() { echo "$PREREQ"; }
+case "${1:-}" in
+    prereqs)
+        prereqs
+        exit 0
+        ;;
+esac
+
+# rutas parametrizadas para poder probarlo fuera del initramfs
+NB_RUN=${NB_RUN:-/run/nutellaboot}
+NBS_CMDLINE=${NBS_CMDLINE:-/proc/cmdline}
+NBS_PARAM=${NBS_PARAM:-/conf/param.conf}
+NBS_CONSOLE=${NBS_CONSOLE:-/dev/console}
+NBS_CONSOLE_IN=${NBS_CONSOLE_IN:-$NBS_CONSOLE}
+NBS_SYS_NET=${NBS_SYS_NET:-/sys/class/net}
+NBS_BYUUID=${NBS_BYUUID:-/dev/disk/by-uuid}
+NBS_BYLABEL=${NBS_BYLABEL:-/dev/disk/by-label/NB3CFG}
+NBS_MNT=${NBS_MNT:-/mnt/nb3staticip}
+# NBS_CFGDIR: un directorio que hace de FAT, sin montar nada (pruebas)
+NBS_CFGDIR=${NBS_CFGDIR:-}
+NBS_TIMEOUT=${NBS_TIMEOUT:-10}
+NBS_TABLE=static-ip.conf
+
+say() { printf '%s\n' "$*" >> "$NBS_CONSOLE"; }
+ask() { printf '%s' "$*" >> "$NBS_CONSOLE"; }
+
+ipv4_ok() {
+    case "$1" in '' | *[!0-9.]* | .* | *. | *..*) return 1 ;; esac
+    _io_ifs=$IFS
+    IFS=.
+    set -- $1
+    IFS=$_io_ifs
+    [ $# -eq 4 ] || return 1
+    for _io_o; do
+        [ ${#_io_o} -le 3 ] && [ "$_io_o" -le 255 ] || return 1
+    done
+}
+
+ip2int() {
+    _ii_ifs=$IFS
+    IFS=.
+    set -- $1
+    IFS=$_ii_ifs
+    echo $((($1 << 24) + ($2 << 16) + ($3 << 8) + $4))
+}
+
+same_net() {
+    _sn_m=$(ip2int "$3")
+    [ $(($(ip2int "$1") & _sn_m)) -eq $(($(ip2int "$2") & _sn_m)) ]
+}
+
+# Ninguna IP: se sigue con DHCP, como sin esta entrada de menú.
+give_up() {
+    say "nb3-staticip: $*; se sigue con DHCP."
+    sleep 3
+    exit 0
+}
+
+# --- parámetros -------------------------------------------------------------
+
+set -f
+read -r _cmdline < "$NBS_CMDLINE"
+gw="" mask="" dns="" net="" cfg="" hasip=""
+for _t in $_cmdline; do
+    case "$_t" in
+        ip=*) hasip=1 ;;
+        nbgw=*) gw=${_t#nbgw=} ;;
+        nbmask=*) mask=${_t#nbmask=} ;;
+        nbdns=*) dns=${_t#nbdns=} ;;
+        nbnet=*) net=${_t#nbnet=} ;;
+        nb3cfg=*) cfg=${_t#nb3cfg=} ;;
+    esac
+done
+set +f
+
+[ -n "$hasip" ] && exit 0
+[ -n "$gw" ] || exit 0
+mask=${mask:-255.255.255.0}
+ipv4_ok "$gw" || give_up "gateway inválido en la línea del kernel ($gw)"
+ipv4_ok "$mask" || give_up "máscara inválida en la línea del kernel ($mask)"
+dns0=""
+dns1=""
+_ifs=$IFS
+IFS=,
+for _d in $dns; do
+    ipv4_ok "$_d" || continue
+    if [ -z "$dns0" ]; then dns0=$_d; elif [ -z "$dns1" ]; then dns1=$_d; fi
+done
+IFS=$_ifs
+
+# --- la placa cableada ------------------------------------------------------
+
+# las placas con cable que el udev ya creó (sin lo, sin wifi, sin virtuales)
+wired_ifaces() {
+    for _w_d in "$NBS_SYS_NET"/*; do
+        _w_i=${_w_d##*/}
+        [ "$_w_i" = lo ] && continue
+        [ -e "$_w_d/device" ] || continue
+        [ -e "$_w_d/wireless" ] || [ -e "$_w_d/phy80211" ] && continue
+        echo "$_w_i"
+    done
+}
+
+_t=0
+while [ -z "$(wired_ifaces)" ] && [ "$_t" -lt 15 ]; do
+    sleep 1
+    _t=$((_t + 1))
+done
+ifaces=$(wired_ifaces)
+[ -n "$ifaces" ] || give_up "no se encontró ninguna placa de red cableada"
+
+# Con varias placas, la que tiene cable conectado: con net.ifnames=0 el nombre
+# eth0 depende del orden en que cargan los drivers, no del puerto.
+dev=""
+for _i in $ifaces; do ip link set "$_i" up 2> /dev/null; done
+_t=0
+while [ -z "$dev" ] && [ "$_t" -le 8 ]; do
+    for _i in $ifaces; do
+        [ "$(cat "$NBS_SYS_NET/$_i/carrier" 2> /dev/null)" = 1 ] && dev=$_i && break
+    done
+    [ -n "$dev" ] && break
+    sleep 1
+    _t=$((_t + 1))
+done
+if [ -z "$dev" ]; then
+    dev=$(echo "$ifaces" | sed -n '1p')
+    echo "$ifaces" | grep -qx eth0 && dev=eth0
+    say "nb3-staticip: ninguna placa tiene cable conectado; se usa $dev."
+fi
+mac=$(tr 'A-F' 'a-f' < "$NBS_SYS_NET/$dev/address" 2> /dev/null)
+[ -n "$mac" ] || give_up "no se pudo leer la MAC de $dev"
+
+# --- la tabla en el pendrive ------------------------------------------------
+
+cfgdir=""
+cfg_rw=""
+cfg_mounted=""
+cfg_device() {
+    if [ -n "$cfg" ]; then
+        _cd_u=$(printf '%s' "$cfg" | tr 'a-f' 'A-F')
+        [ -e "$NBS_BYUUID/$_cd_u" ] && readlink -f "$NBS_BYUUID/$_cd_u" && return 0
+    fi
+    [ -e "$NBS_BYLABEL" ] && readlink -f "$NBS_BYLABEL" && return 0
+    return 1
+}
+if [ -n "$NBS_CFGDIR" ]; then
+    cfgdir=$NBS_CFGDIR
+    [ -w "$cfgdir" ] && cfg_rw=1
+else
+    _t=0
+    _cfgdev=""
+    while [ "$_t" -lt 10 ]; do
+        command -v udevadm > /dev/null 2>&1 && udevadm settle --timeout=1 > /dev/null 2>&1
+        _cfgdev=$(cfg_device) && break
+        sleep 1
+        _t=$((_t + 1))
+    done
+    if [ -n "$_cfgdev" ]; then
+        modprobe -q vfat 2> /dev/null
+        mkdir -p "$NBS_MNT"
+        if mount -t vfat -o rw "$_cfgdev" "$NBS_MNT" 2> /dev/null; then
+            cfg_rw=1
+        elif mount -t vfat -o ro "$_cfgdev" "$NBS_MNT" 2> /dev/null; then
+            :
+        else
+            _cfgdev=""
+        fi
+        [ -n "$_cfgdev" ] && cfgdir=$NBS_MNT && cfg_mounted=1
+    fi
+    [ -n "$cfgdir" ] || say "nb3-staticip: no se encontró la partición NB3CFG; la IP no quedará guardada."
+fi
+table=${cfgdir:+$cfgdir/$NBS_TABLE}
+
+# lookup <mac>: la IP anotada para esa MAC (acepta mayúsculas, guiones y CRLF)
+lookup() {
+    [ -n "$table" ] && [ -f "$table" ] || return 0
+    tr -d '\r' < "$table" | awk -v m="$1" '
+        /^[ \t]*#/ { next }
+        { k = tolower($1); gsub(/-/, ":", k) }
+        k == m { print $2; exit }'
+}
+# owner <ip> <mac>: otra MAC que ya tiene esa IP en la tabla
+owner() {
+    [ -n "$table" ] && [ -f "$table" ] || return 0
+    tr -d '\r' < "$table" | awk -v ip="$1" -v m="$2" '
+        /^[ \t]*#/ { next }
+        { k = tolower($1); gsub(/-/, ":", k) }
+        $2 == ip && k != m { print $1; exit }'
+}
+
+finish_cfg() {
+    if [ -n "$cfg_mounted" ]; then
+        sync
+        umount "$NBS_MNT" 2> /dev/null
+    fi
+}
+
+# --- la IP --------------------------------------------------------------------
+
+# la consola se abre una vez: cada `read < archivo` volvería al principio
+exec 3< "$NBS_CONSOLE_IN" || give_up "no se pudo abrir la consola"
+say ""
+say "=== IP fija (sala sin DHCP) ==="
+say "Placa: $dev   MAC: $mac"
+say "Gateway: $gw   Máscara: $mask${dns0:+   DNS: $dns0${dns1:+ $dns1}}"
+
+known=$(lookup "$mac")
+if [ -n "$known" ] && ! { ipv4_ok "$known" && same_net "$known" "$gw" "$mask"; }; then
+    say "static-ip.conf tiene \"$known\" para esta MAC, pero no es una IP de esta red."
+    known=""
+fi
+
+choice=""
+ans=""
+if [ -n "$known" ]; then
+    say "IP guardada para esta máquina: $known"
+    ask "Enter = usarla; o escribe otra IP (dhcp = usar DHCP). Sigue sola en ${NBS_TIMEOUT}s: "
+    read -t "$NBS_TIMEOUT" -r ans <&3 || ans=""
+    say ""
+    [ -z "$ans" ] && choice=$known
+fi
+while [ -z "$choice" ]; do
+    if [ -z "$ans" ]; then
+        ask "IP de esta máquina${net:+ (o solo el final, después de $net)}; dhcp = usar DHCP: "
+        read -r ans <&3 || { finish_cfg; give_up "no hay teclado"; }
+    fi
+    case "$ans" in
+        dhcp | DHCP)
+            finish_cfg
+            give_up "elegido DHCP"
+            ;;
+    esac
+    _ip=$ans
+    if [ -n "$net" ]; then
+        # "50" con nbnet=192.168.1. -> 192.168.1.50
+        case "$ans" in *.*.*.*) ;; *) _ip=$net$ans ;; esac
+    fi
+    ans=""
+    if ! ipv4_ok "$_ip"; then
+        say "\"$_ip\" no es una IP válida (cuatro números de 0 a 255, separados por puntos)."
+        continue
+    fi
+    if ! same_net "$_ip" "$gw" "$mask"; then
+        say "$_ip no está en la red del gateway $gw/$mask."
+        continue
+    fi
+    if [ "$_ip" = "$gw" ]; then
+        say "$_ip es el gateway."
+        continue
+    fi
+    _other=$(owner "$_ip" "$mac")
+    if [ -n "$_other" ]; then
+        ask "Atención: $_ip ya está anotada para la MAC $_other. ¿Usarla igual? [s/N] "
+        read -r _yn <&3 || _yn=""
+        case "$_yn" in s | S | si | SI | sí | y | Y) ;; *) continue ;; esac
+    fi
+    choice=$_ip
+done
+
+# --- guardar en la tabla ------------------------------------------------------
+
+if [ "$choice" != "$known" ] && [ -n "$table" ]; then
+    if [ -n "$cfg_rw" ]; then
+        _tmp=$cfgdir/.static-ip.tmp
+        {
+            if [ -f "$table" ]; then
+                tr -d '\r' < "$table" | awk -v m="$mac" '
+                    /^[ \t]*#/ || NF == 0 { print; next }
+                    { k = tolower($1); gsub(/-/, ":", k) }
+                    k != m { print }'
+            else
+                echo "# Tabla de IPs fijas por máquina (nb3-staticip): MAC e IP, separadas por espacios o TAB."
+            fi
+            printf '%s\t%s\n' "$mac" "$choice"
+        } > "$_tmp" && mv -f "$_tmp" "$table" && sync &&
+            say "Guardada en $NBS_TABLE: $mac -> $choice" ||
+            { rm -f "$_tmp"; say "nb3-staticip: no se pudo guardar en $NBS_TABLE; vale solo para este arranque."; }
+    else
+        say "nb3-staticip: el pendrive no se pudo escribir; la IP vale solo para este arranque."
+    fi
+fi
+finish_cfg
+
+# --- entregar al initramfs ----------------------------------------------------
+
+# formato ip= del kernel: cliente:servidor:gw:máscara:hostname:dev:autoconf:dns0:dns1
+echo "IP='$choice::$gw:$mask::$dev:off:$dns0:$dns1'" >> "$NBS_PARAM"
+mkdir -p "$NB_RUN"
+{
+    echo "dev=$dev"
+    echo "ip=$choice"
+    echo "mask=$mask"
+    echo "gw=$gw"
+    echo "dns=$dns0${dns1:+,$dns1}"
+} > "$NB_RUN/static-ip"
+say "IP fija: $choice/$mask en $dev, gateway $gw."
+say ""
+exit 0
