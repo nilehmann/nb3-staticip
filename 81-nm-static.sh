@@ -32,8 +32,15 @@ nb3_post_nm_static() {
     _nms_gw=$(nb3_nms_val gw "$_nms_conf")
     _nms_dns=$(nb3_nms_val dns "$_nms_conf")
 
-    # el nombre de la interfaz va al archivo: nada de barras ni cosas raras
-    case "$_nms_dev" in '' | *[!A-Za-z0-9_.-]* | .*) _nms_dev=eth0 ;; esac
+    # el nombre de la interfaz va al archivo: nada de barras ni cosas raras. Si
+    # no sirve, el perfil queda sin interface-name y el NetworkManager lo usa en
+    # la placa cableada que haya, en vez de atarlo a una que quizás no es.
+    case "$_nms_dev" in
+        '' | *[!A-Za-z0-9_.-]* | .*)
+            nb_warn "static-ip: invalid interface ($_nms_dev); profile not bound to an interface"
+            _nms_dev=""
+            ;;
+    esac
     if ! nb3_nms_ipv4 "$_nms_ip" || ! nb3_nms_ipv4 "$_nms_gw"; then
         nb_warn "static-ip: invalid address ($_nms_ip) or gateway ($_nms_gw); no static profile"
         return 0
@@ -55,7 +62,7 @@ nb3_post_nm_static() {
         # deriva uno de la ruta del archivo
         command -v nb3_uuid_for > /dev/null 2>&1 && echo "uuid=$(nb3_uuid_for nb3-static)"
         echo "type=ethernet"
-        echo "interface-name=$_nms_dev"
+        [ -n "$_nms_dev" ] && echo "interface-name=$_nms_dev"
         echo "autoconnect=true"
         echo "autoconnect-priority=100"
         echo
@@ -70,7 +77,7 @@ nb3_post_nm_static() {
         echo "method=ignore"
     } > "$_nms_file"
     chmod 600 "$_nms_file"
-    nb_log "static network profile generated for NetworkManager ($_nms_ip/$_nms_pfx on $_nms_dev)"
+    nb_log "static network profile generated for NetworkManager ($_nms_ip/$_nms_pfx on ${_nms_dev:-any wired interface})"
 }
 
 # nb3_nms_val <clave> <archivo> — primer valor de clave=valor, sin comillas ni CR
