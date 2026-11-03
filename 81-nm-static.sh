@@ -80,7 +80,7 @@ nb3_nms_val() {
 
 # 4 octetos decimales de 0 a 255
 nb3_nms_ipv4() {
-    case "$1" in '' | *[!0-9.]* | .* | *. | *..*) return 1 ;; esac
+    case "$1" in '' | *[!0-9.]* | .* | *. | *..* | 0[0-9]* | *.0[0-9]*) return 1 ;; esac
     _nmi_ifs=$IFS
     IFS=.
     # shellcheck disable=SC2086

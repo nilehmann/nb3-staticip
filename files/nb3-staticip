@@ -41,7 +41,7 @@ say() { printf '%s\n' "$*" >> "$NBS_CONSOLE"; }
 ask() { printf '%s' "$*" >> "$NBS_CONSOLE"; }
 
 ipv4_ok() {
-    case "$1" in '' | *[!0-9.]* | .* | *. | *..*) return 1 ;; esac
+    case "$1" in '' | *[!0-9.]* | .* | *. | *..* | 0[0-9]* | *.0[0-9]*) return 1 ;; esac
     _io_ifs=$IFS
     IFS=.
     set -- $1
@@ -63,6 +63,13 @@ ip2int() {
 same_net() {
     _sn_m=$(ip2int "$3")
     [ $(($(ip2int "$1") & _sn_m)) -eq $(($(ip2int "$2") & _sn_m)) ]
+}
+
+# ni la dirección de red ni la de broadcast (en /31 y /32 no las hay)
+host_ok() {
+    _ho_m=$(ip2int "$2")
+    _ho_h=$(($(ip2int "$1") & (_ho_m ^ 0xFFFFFFFF)))
+    [ "$_ho_m" -ge $((0xFFFFFFFE)) ] || { [ "$_ho_h" -ne 0 ] && [ "$_ho_h" -ne $((_ho_m ^ 0xFFFFFFFF)) ]; }
 }
 
 # Ninguna IP: se sigue con DHCP, como sin esta entrada de menú.
@@ -221,8 +228,8 @@ say "Placa: $dev   MAC: $mac"
 say "Gateway: $gw   Máscara: $mask${dns0:+   DNS: $dns0${dns1:+ $dns1}}"
 
 known=$(lookup "$mac")
-if [ -n "$known" ] && ! { ipv4_ok "$known" && same_net "$known" "$gw" "$mask"; }; then
-    say "static-ip.conf tiene \"$known\" para esta MAC, pero no es una IP de esta red."
+if [ -n "$known" ] && ! { ipv4_ok "$known" && same_net "$known" "$gw" "$mask" && host_ok "$known" "$mask"; }; then
+    say "static-ip.conf tiene \"$known\" para esta MAC, pero no sirve como IP de esta red."
     known=""
 fi
 
@@ -262,6 +269,10 @@ while [ -z "$choice" ]; do
     fi
     if [ "$_ip" = "$gw" ]; then
         say "$_ip es el gateway."
+        continue
+    fi
+    if ! host_ok "$_ip" "$mask"; then
+        say "$_ip es la dirección de red o de broadcast de $gw/$mask."
         continue
     fi
     _other=$(owner "$_ip" "$mac")
