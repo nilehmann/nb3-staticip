@@ -71,8 +71,46 @@ class Error(Exception):
     pass
 
 
+# --- colores ------------------------------------------------------------------
+
+# Solo en una terminal y sin NO_COLOR (https://no-color.org): redirigido a un
+# archivo o a un pipe queda texto plano, igual que antes.
+RESET, BOLD, DIM = "\033[0m", "\033[1m", "\033[2m"
+RED, GREEN, YELLOW, CYAN = "\033[31m", "\033[32m", "\033[33m", "\033[36m"
+
+
+def use_color(stream):
+    return stream.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM") != "dumb"
+
+
+def paint(text, *codes, stream=sys.stdout):
+    return "".join(codes) + text + RESET if codes and use_color(stream) else text
+
+
+def paint_diff(diff):
+    """Colorea un diff de `unified`: encabezado en negrita, @@ en cian, líneas
+    agregadas en verde y quitadas en rojo."""
+    out = []
+    for line in diff.splitlines(keepends=True):
+        if line.startswith("--- "):
+            out.append(paint(line.rstrip("\n"), BOLD) + "\n")
+        elif line.startswith("@@"):
+            out.append(paint(line.rstrip("\n"), CYAN) + "\n")
+        elif line.startswith("+"):
+            out.append(paint(line.rstrip("\n"), GREEN) + "\n")
+        elif line.startswith("-"):
+            out.append(paint(line.rstrip("\n"), RED) + "\n")
+        else:
+            out.append(line)
+    return "".join(out)
+
+
 def warn(msg):
-    print(f"aviso: {msg}", file=sys.stderr)
+    print(f"{paint('aviso:', YELLOW, BOLD, stream=sys.stderr)} {msg}", file=sys.stderr)
+
+
+def error(msg):
+    print(f"{paint('error:', RED, BOLD, stream=sys.stderr)} {msg}", file=sys.stderr)
 
 
 # --- validaciones -----------------------------------------------------------
@@ -629,7 +667,7 @@ def main():
     try:
         p = plan(args)
     except (Error, OSError) as e:
-        print(f"error: {e}", file=sys.stderr)
+        error(e)
         return 1
 
     gw, mask, dns, prefix = p["net"]
@@ -638,15 +676,15 @@ def main():
           + (f", prefijo {prefix}" + (" (deducido)" if p["prefix_derived"] else "") if prefix else ""))
     print()
     for name, status in p["report"]:
-        print(f"  {name:<18} {status}")
+        print(f"  {name:<18} " + paint(status, DIM if status.startswith("ya estaba") else YELLOW))
     if not p["writes"]:
-        print("\nTodo ya está en el pendrive: no hay nada que cambiar.")
+        print("\n" + paint("Todo ya está en el pendrive: no hay nada que cambiar.", GREEN))
         return 0
     print()
     for d in p["diffs"]:
-        print(d)
+        print(paint_diff(d))
     if args.dry_run:
-        print("(--dry-run: no se escribió nada)")
+        print(paint("(--dry-run: no se escribió nada)", CYAN, BOLD))
         return 0
 
     try:
@@ -661,15 +699,15 @@ def main():
         stamp = apply(p)
         fails = verify(p)
     except (Error, OSError) as e:
-        print(f"error: {e}", file=sys.stderr)
+        error(e)
         return 1
     if fails:
         for f in fails:
-            print(f"  FALLÓ: {f}", file=sys.stderr)
-        print(f"error: la verificación falló; las copias están en *.bak-{stamp}", file=sys.stderr)
+            print(f"  {paint('FALLÓ:', RED, BOLD, stream=sys.stderr)} {f}", file=sys.stderr)
+        error(f"la verificación falló; las copias están en *.bak-{stamp}")
         return 1
 
-    print(f"\nListo. Copias de lo anterior: *.bak-{stamp}")
+    print("\n" + paint("Listo.", GREEN, BOLD) + f" Copias de lo anterior: *.bak-{stamp}")
     print("Siguientes pasos:")
     print("  - En el servidor, client/stuff/60-postmount.d/81-nm-static.sh (sin él, el")
     print("    escritorio queda sin red).")
