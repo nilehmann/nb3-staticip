@@ -34,7 +34,7 @@ NBS_BYLABEL=${NBS_BYLABEL:-/dev/disk/by-label/NB3CFG}
 NBS_MNT=${NBS_MNT:-/mnt/nb3staticip}
 # NBS_CFGDIR: un directorio que hace de FAT, sin montar nada (pruebas)
 NBS_CFGDIR=${NBS_CFGDIR:-}
-NBS_TIMEOUT=${NBS_TIMEOUT:-10}
+NBS_TIMEOUT=${NBS_TIMEOUT:-3}
 NBS_TABLE=static-ip.conf
 
 say() { printf '%s\n' "$*" >> "$NBS_CONSOLE"; }
@@ -211,6 +211,47 @@ owner() {
         $2 == ip && k != m { print $1; exit }'
 }
 
+# edit_line <texto> [segundos]: lee una línea de la consola con <texto> ya
+# escrito y editable (Retroceso borra, Ctrl-U borra todo); queda en $ans. Con
+# [segundos], si no se toca ninguna tecla en ese plazo queda <texto> tal cual
+# (también si no hay teclado); el plazo es solo para la primera. Lee de a un
+# carácter con el read -n del busybox, que apaga el modo canónico mientras
+# lee; el stty (si está) lo deja apagado entre carácter y carácter, para que
+# el kernel no haga eco de lo que se teclea rápido.
+BS=$(printf '\b')
+DEL=$(printf '\177')
+NAK=$(printf '\025')
+ESC=$(printf '\033')
+edit_line() {
+    ans=$1
+    _el_t=${2:-}
+    _el_tty=$(stty -g <&3 2> /dev/null) && stty -icanon -echo <&3 2> /dev/null || _el_tty=""
+    ask "$ans"
+    while :; do
+        if [ -n "$_el_t" ]; then
+            IFS= read -r -s -n 1 -t "$_el_t" _el_c <&3 || break
+            _el_t=""
+        elif ! IFS= read -r -s -n 1 _el_c <&3; then
+            [ -n "$_el_tty" ] && stty "$_el_tty" <&3
+            return 1
+        fi
+        case "$_el_c" in
+            '') break ;;
+            "$BS" | "$DEL")
+                [ -n "$ans" ] && ans=${ans%?} && ask "$BS $BS"
+                ;;
+            "$NAK")
+                while [ -n "$ans" ]; do ans=${ans%?} && ask "$BS $BS"; done
+                ;;
+            # flechas y otras teclas especiales (ESC [ X): se ignoran
+            "$ESC") IFS= read -r -s -n 2 -t 1 _el_c <&3 ;;
+            [0-9A-Za-z.]) ans=$ans$_el_c && ask "$_el_c" ;;
+        esac
+    done
+    [ -n "$_el_tty" ] && stty "$_el_tty" <&3
+    say ""
+}
+
 finish_cfg() {
     if [ -n "$cfg_mounted" ]; then
         sync
@@ -233,19 +274,25 @@ if [ -n "$known" ] && ! { ipv4_ok "$known" && same_net "$known" "$gw" "$mask" &&
     known=""
 fi
 
+# lo que se ofrece ya escrito: la IP guardada o el prefijo y, tras un error,
+# lo último tecleado. Con IP guardada, sin tocar nada sigue sola con ella.
 choice=""
-ans=""
+pre=$net
+limit=""
 if [ -n "$known" ]; then
-    say "IP guardada para esta máquina: $known"
-    ask "Enter = usarla; o escribe otra IP (dhcp = usar DHCP). Sigue sola en ${NBS_TIMEOUT}s: "
-    read -t "$NBS_TIMEOUT" -r ans <&3 || ans=""
-    say ""
-    [ -z "$ans" ] && choice=$known
+    say "IP guardada para esta máquina: $known (Enter = usarla, o edítala; sigue sola en ${NBS_TIMEOUT}s)"
+    pre=$known
+    limit=$NBS_TIMEOUT
 fi
 while [ -z "$choice" ]; do
-    if [ -z "$ans" ]; then
-        ask "IP de esta máquina${net:+ (o solo el final, después de $net)}; dhcp = usar DHCP: "
-        read -r ans <&3 || { finish_cfg; give_up "no hay teclado"; }
+    ask "IP de esta máquina (dhcp = usar DHCP): "
+    edit_line "$pre" $limit || { finish_cfg; give_up "no hay teclado"; }
+    limit=""
+    [ -z "$ans" ] && continue
+    # la guardada ya pasó los controles, y que otra MAC la tenga no es nuevo
+    if [ -n "$known" ] && [ "$ans" = "$known" ]; then
+        choice=$known
+        break
     fi
     case "$ans" in
         dhcp | DHCP)
@@ -258,7 +305,7 @@ while [ -z "$choice" ]; do
         # "50" con nbnet=192.168.1. -> 192.168.1.50
         case "$ans" in *.*.*.*) ;; *) _ip=$net$ans ;; esac
     fi
-    ans=""
+    pre=$_ip
     if ! ipv4_ok "$_ip"; then
         say "\"$_ip\" no es una IP válida (cuatro números de 0 a 255, separados por puntos)."
         continue
