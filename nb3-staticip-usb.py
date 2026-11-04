@@ -19,6 +19,14 @@ enteros: /24 o /26 -> "192.168.1.", /16 -> "192.168."). Hace falta solo para
 alargarlo en una red grande (una /16 donde la sala está toda en 172.17.68.x),
 y con prefijo = "" no hay atajo.
 
+Las IPs de las máquinas pueden ir también en el TOML, en una sección [ips]
+opcional (MAC -> IP completa, de la red del gateway):
+  [ips]
+  "aa:bb:cc:dd:ee:01" = "192.168.1.50"
+  "aa:bb:cc:dd:ee:02" = "192.168.1.51"
+Se fusionan con las de static-ip.conf: para esas MACs manda el TOML, y las
+demás líneas del pendrive (las tecleadas al arrancar, por ejemplo) quedan.
+
 Los archivos que van al pendrive viven en files/, junto a este script:
   files/nb3-staticip    script del initrd (sh/busybox) -> se empaqueta en
                         nb3-staticip.cpio con el ORDER del initrd
@@ -26,8 +34,8 @@ Los archivos que van al pendrive viven en files/, junto a este script:
   files/grub-block.cfg  bloque "IP fija" -> se inserta en grub.cfg
 
 grub.cfg y nutellaboot.conf se EDITAN, no se reemplazan: cada pendrive trae
-su sede, su servidor y su NB_BOOT_KEY. static-ip.conf nunca se sobrescribe:
-las IPs de las máquinas se editan directo en el pendrive.
+su sede, su servidor y su NB_BOOT_KEY. static-ip.conf solo se toca si el TOML
+trae [ips], y solo en las líneas de esas MACs.
 
 Se puede correr las veces que haga falta: lo que ya está igual no se toca, y
 antes de escribir muestra los cambios y pide confirmación. Hay que volver a
@@ -65,6 +73,7 @@ ORDER_PATH = "scripts/init-premount/ORDER"
 SCRIPT_PATH = "scripts/init-premount/nb3-staticip"
 NET_KEYS = ("NB_NET_GW", "NB_NET_MASK", "NB_NET_DNS", "NB_NET_PREFIX")
 TOML_KEYS = ("gateway", "mascara", "dns", "prefijo")
+TOML_SECTIONS = ("red", "ips")
 
 
 class Error(Exception):
@@ -140,6 +149,13 @@ def same_net(ip, gw, mask):
     return ipaddress.IPv4Address(ip) in ipaddress.IPv4Network(f"{gw}/{mask}", strict=False)
 
 
+def host_ok(ip, mask):
+    """Ni la dirección de red ni la de broadcast (salvo en /31 y /32, que no
+    las tienen); lo mismo que el host_ok del initrd."""
+    net = ipaddress.IPv4Network(f"{ip}/{mask}", strict=False)
+    return net.prefixlen >= 31 or ipaddress.IPv4Address(ip) not in (net.network_address, net.broadcast_address)
+
+
 def derived_prefix(gw, mask):
     """Los octetos que la máscara fija enteros, que toda IP de la red comparte
     con el gateway: 172.17.68.65/26 -> "172.17.68.", 10.0.115.1/23 -> "10.0."."""
@@ -164,9 +180,11 @@ def norm_mac(mac):
 
 
 def read_net(path):
-    """[red] del TOML -> (gateway, máscara, dns "a,b", prefijo). Una clave
+    """[red] del TOML -> (gateway, máscara, dns "a,b", prefijo, ips). Una clave
     opcional ausente queda en None (se conserva la de nutellaboot.conf); vacía
-    ("" o []) queda en "" (se borra del conf)."""
+    ("" o []) queda en "" (se borra del conf). ips es {mac: ip} con la MAC
+    normalizada, o None sin sección [ips]; que las IPs sean de la red se
+    revisa después, cuando ya se sabe la máscara."""
     try:
         with open(path, "rb") as f:
             data = tomllib.load(f)
@@ -174,9 +192,10 @@ def read_net(path):
         raise Error(f"no existe {path}")
     except tomllib.TOMLDecodeError as e:
         raise Error(f"{path}: {e}")
-    extra = sorted(set(data) - {"red"})
+    extra = sorted(set(data) - set(TOML_SECTIONS))
     if extra:
-        raise Error(f"{path}: sección desconocida: {', '.join(extra)} (solo se admite [red])")
+        raise Error(f"{path}: sección desconocida: {', '.join(extra)} "
+                    f"(se admiten {', '.join(f'[{x}]' for x in TOML_SECTIONS)})")
     red = data.get("red")
     if not isinstance(red, dict):
         raise Error(f"{path}: falta la sección [red]")
@@ -210,7 +229,29 @@ def read_net(path):
         raise Error(f"{path}: [red] mascara inválida: {mask}")
     if prefix and not prefix_ok(prefix):
         raise Error(f"{path}: [red] prefijo inválido: {prefix} (por ejemplo 192.168.1.)")
-    return gw, mask, dns, prefix
+    return gw, mask, dns, prefix, read_ips(path, data.get("ips"))
+
+
+def read_ips(path, ips):
+    if ips is None:
+        return None
+    if not isinstance(ips, dict):
+        raise Error(f'{path}: [ips] tiene que ser una sección, ej.: "aa:bb:cc:dd:ee:01" = "192.168.1.50"')
+    out, owners = {}, {}
+    for key, ip in ips.items():
+        mac = norm_mac(key)
+        if mac is None:
+            raise Error(f'{path}: [ips] MAC inválida: "{key}"')
+        if mac in out:
+            raise Error(f"{path}: [ips] la MAC {mac} aparece más de una vez")
+        if not isinstance(ip, str) or not ipv4_ok(ip.strip()):
+            raise Error(f'{path}: [ips] "{key}": "{ip}" no es una IP completa, ej.: "192.168.1.50"')
+        ip = ip.strip()
+        if ip in owners:
+            raise Error(f"{path}: [ips] la IP {ip} está asignada a {owners[ip]} y a {mac}")
+        out[mac] = ip
+        owners[ip] = mac
+    return out
 
 
 # --- nutellaboot.conf -------------------------------------------------------
@@ -457,7 +498,7 @@ def plan(args):
 
     # valores: TOML > nutellaboot.conf > predeterminados
     cur = {k: conf_get(conf, k) for k in NET_KEYS}
-    t_gw, t_mask, t_dns, t_prefix = read_net(args.toml)
+    t_gw, t_mask, t_dns, t_prefix, ips = read_net(args.toml)
     gw = t_gw
     mask = (cur["NB_NET_MASK"] if t_mask is None else t_mask) or "255.255.255.0"
     dns = (cur["NB_NET_DNS"] if t_dns is None else t_dns) or ""
@@ -475,13 +516,18 @@ def plan(args):
         pnet = ipaddress.IPv4Network(f"{'.'.join(octs + ['0'] * (4 - len(octs)))}/{8 * len(octs)}")
         if not pnet.overlaps(ipaddress.IPv4Network(f"{gw}/{mask}", strict=False)):
             raise Error(f"el prefijo {prefix} no está en la red de {gw}/{mask}")
+    for mac, ip in (ips or {}).items():
+        if not same_net(ip, gw, mask):
+            raise Error(f"{args.toml}: [ips] {mac}: {ip} no está en la red {gw}/{mask}")
+        if ip == gw or not host_ok(ip, mask):
+            raise Error(f"{args.toml}: [ips] {mac}: {ip} no sirve como IP de una máquina en {gw}/{mask}")
     if not dns:
         warn("sin dns en el TOML: el sistema final no va a resolver nombres (a menos que el servidor esté en NB_HOSTS)")
     if "\r" in conf:
         warn("nutellaboot.conf tiene fin de línea de Windows (CRLF): el GRUB podría leer mal los valores")
 
     p = {"dest": dest, "net": (gw, mask, dns, prefix), "prefix_derived": t_prefix is None,
-         "writes": [], "report": [], "diffs": []}
+         "ips": ips, "table_before": None, "writes": [], "report": [], "diffs": []}
 
     # 1. nutellaboot.conf: solo las líneas NB_NET_*; lo demás no se toca
     new_conf = conf if conf.endswith("\n") or not conf else conf + "\n"
@@ -565,20 +611,73 @@ def plan(args):
         )
     p["want_cpio"] = want
 
-    # 4. static-ip.conf: se revisa, nunca se reescribe
-    if table_path.exists():
-        p["report"].append((TABLE_NAME, check_table(table_path, gw, mask)))
-    else:
-        p["report"].append((TABLE_NAME, "se crea (vacía, con instrucciones)"))
-        p["writes"].append((TABLE_NAME, table_tpl, False))
+    # 4. static-ip.conf: sin [ips] se revisa y no se toca; con [ips] se
+    # fusiona, y solo cambian las líneas de esas MACs
+    exists = table_path.exists()
+    if exists:
+        p["table_before"] = table_path.read_bytes()
+    if ips is None:
+        if exists:
+            n, bad = check_table(p["table_before"].decode("utf-8", "replace"), gw, mask)
+            p["report"].append((TABLE_NAME, f"ya estaba ({table_summary(n, bad)}); no se toca"))
+        else:
+            p["report"].append((TABLE_NAME, "se crea (vacía, con instrucciones)"))
+            p["writes"].append((TABLE_NAME, table_tpl, False))
+        return p
+    old = (p["table_before"] if exists else table_tpl).decode("utf-8", "surrogateescape").replace("\r", "")
+    new, counts = merge_table(old, ips)
+    n, bad = check_table(new, gw, mask)
+    if exists and not any(counts.values()):
+        p["report"].append((TABLE_NAME, f"ya estaba ({table_summary(n, bad)})"))
+        return p
+    done = [f"{v} {k}" for k, v in counts.items() if v]
+    p["report"].append((TABLE_NAME, ("se actualiza: " if exists else "se crea: ") + ", ".join(done)
+                        + f" ({table_summary(n, bad)})"))
+    p["writes"].append((TABLE_NAME, new.encode("utf-8", "surrogateescape"), exists))
+    p["diffs"].append(unified(old, new, TABLE_NAME))
     return p
 
 
-def check_table(path, gw, mask):
+def merge_table(text, ips):
+    """Pone las IPs de [ips] en el texto de static-ip.conf. La primera línea de
+    cada una de esas MACs queda con su IP y las repetidas se borran; las que
+    faltan van al final. Lo demás (comentarios, otras MACs) queda igual. Error
+    si una MAC de fuera del TOML tiene una IP que el TOML le da a otra: eso
+    hay que decidirlo a mano. -> (texto nuevo, {qué: cuántas})."""
+    owner = {ip: mac for mac, ip in ips.items()}
+    counts = {"nuevas": 0, "cambian": 0, "repetidas que se borran": 0}
+    seen, out = set(), []
+    for ln, line in enumerate(text.splitlines(), 1):
+        f = line.split()
+        mac = norm_mac(f[0]) if f and not f[0].startswith("#") else None
+        if mac in ips:
+            if mac in seen:
+                counts["repetidas que se borran"] += 1
+                continue
+            seen.add(mac)
+            if len(f) < 2 or f[1] != ips[mac]:
+                counts["cambian"] += 1
+                line = f"{mac}\t{ips[mac]}"
+        elif mac is not None and len(f) > 1 and f[1] in owner:
+            raise Error(f"static-ip.conf línea {ln}: {f[1]} es de {mac}, pero [ips] se la da a {owner[f[1]]}; "
+                        f"agrega {mac} a [ips] con otra IP o borra esa línea del pendrive")
+        out.append(line)
+    for mac, ip in ips.items():
+        if mac not in seen:
+            counts["nuevas"] += 1
+            out.append(f"{mac}\t{ip}")
+    return "".join(ln + "\n" for ln in out), counts
+
+
+def table_summary(n, bad):
+    return f"{n} máquinas" + (f", {bad} líneas con problemas" if bad else "")
+
+
+def check_table(text, gw, mask):
+    """Avisa de lo que el initrd no va a poder usar. -> (máquinas, malas)."""
     n = bad = 0
     macs, ips = {}, {}
-    text = path.read_text(encoding="utf-8", errors="replace").replace("\r", "")
-    for ln, line in enumerate(text.splitlines(), 1):
+    for ln, line in enumerate(text.replace("\r", "").splitlines(), 1):
         f = line.split()
         if not f or f[0].startswith("#"):
             continue
@@ -590,6 +689,8 @@ def check_table(path, gw, mask):
             warn(f'static-ip.conf línea {ln}: IP inválida "{f[1] if len(f) > 1 else ""}"')
         elif not same_net(f[1], gw, mask):
             warn(f"static-ip.conf línea {ln}: {f[1]} no está en la red {gw}/{mask}")
+        elif f[1] == gw or not host_ok(f[1], mask):
+            warn(f"static-ip.conf línea {ln}: {f[1]} no sirve como IP de una máquina en {gw}/{mask}")
         else:
             macs.setdefault(mac, []).append(ln)
             ips.setdefault(f[1], []).append(ln)
@@ -601,8 +702,7 @@ def check_table(path, gw, mask):
     for ip, lns in ips.items():
         if len(lns) > 1:
             warn(f"static-ip.conf: la IP {ip} está asignada a más de una MAC (líneas {', '.join(map(str, lns))})")
-    msg = f"{n} máquinas" + (f", {bad} líneas con problemas" if bad else "")
-    return f"ya estaba ({msg}); no se toca"
+    return n, bad
 
 
 # --- escritura y verificación -------------------------------------------------
@@ -621,10 +721,15 @@ def install(dest, name, data):
 def apply(p):
     dest = p["dest"]
     stamp = time.strftime("%Y%m%d-%H%M%S")
+    # la tabla se fusionó con lo que había al planear: si cambió mientras se
+    # confirmaba (o apareció), escribirla pisaría lo nuevo
+    table = dest / TABLE_NAME
+    if any(name == TABLE_NAME for name, _, _ in p["writes"]):
+        now = table.read_bytes() if table.exists() else None
+        if now != p["table_before"]:
+            raise Error(f"{TABLE_NAME} cambió mientras se confirmaba; no se escribió nada, vuelve a correr el script")
     for name, data, backup in p["writes"]:
         target = dest / name
-        if name == TABLE_NAME and target.exists():
-            continue  # alguien la creó mientras se confirmaba
         if backup:
             shutil.copyfile(target, dest / f"{name}.bak-{stamp}")
         install(dest, name, data)
@@ -636,7 +741,7 @@ def verify(p):
     dest = p["dest"]
     fails = []
     for name, data, _ in p["writes"]:
-        if name != TABLE_NAME and (dest / name).read_bytes() != data:
+        if (dest / name).read_bytes() != data:
             fails.append(f"{name} no quedó como se escribió")
     conf = (dest / "nutellaboot.conf").read_text(encoding="utf-8", errors="replace")
     if conf_get(conf, "NB_NET_GW") != p["net"][0]:
@@ -660,7 +765,8 @@ def main():
     ap = argparse.ArgumentParser(
         description='Instala la entrada "IP fija" (salas sin DHCP) en un pendrive NutellaBoot 3.')
     ap.add_argument("dest", help="la partición NB3CFG del pendrive, montada (ej.: /mnt/nb3)")
-    ap.add_argument("toml", help="la red de la sala: sección [red] con gateway, mascara, dns, prefijo")
+    ap.add_argument("toml", help="la red de la sala: sección [red] con gateway, mascara, dns, prefijo; "
+                    "y, opcional, [ips] con MAC = IP")
     ap.add_argument("--dry-run", action="store_true", help="mostrar los cambios sin escribir nada")
     args = ap.parse_args()
 
@@ -673,7 +779,8 @@ def main():
     gw, mask, dns, prefix = p["net"]
     print(f"Pendrive: {p['dest']}")
     print(f"Red ({args.toml}): gateway {gw}, máscara {mask}" + (f", DNS {dns}" if dns else "")
-          + (f", prefijo {prefix}" + (" (deducido)" if p["prefix_derived"] else "") if prefix else ""))
+          + (f", prefijo {prefix}" + (" (deducido)" if p["prefix_derived"] else "") if prefix else "")
+          + (f"; {len(p['ips'])} IPs en [ips]" if p["ips"] is not None else ""))
     print()
     for name, status in p["report"]:
         print(f"  {name:<18} " + paint(status, DIM if status.startswith("ya estaba") else YELLOW))
