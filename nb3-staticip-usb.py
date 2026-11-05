@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Instala en un pendrive NutellaBoot 3 la entrada de menú "IP fija", para
-salas sin DHCP, sin regenerar initrd.img ni la imagen.
+salas sin DHCP, y el soporte de BitLocker con clave en claro, sin regenerar
+initrd.img ni la imagen.
 
 Uso:
   nb3-staticip-usb.py <pendrive montado> <red.toml> [--dry-run]
@@ -28,10 +29,31 @@ Se fusionan con las de static-ip.conf: para esas MACs manda el TOML, y las
 demás líneas del pendrive (las tecleadas al arrancar, por ejemplo) quedan.
 
 Los archivos que van al pendrive viven en files/, junto a este script:
-  files/nb3-staticip    script del initrd (sh/busybox) -> se empaqueta en
-                        nb3-staticip.cpio con el ORDER del initrd
-  files/static-ip.conf  tabla MAC -> IP vacía -> se copia si falta
-  files/grub-block.cfg  bloque "IP fija" -> se inserta en grub.cfg
+  files/nb3-staticip       script del initrd (sh/busybox): la IP fija
+  files/nb3-bitlocker      script del initrd (sh/busybox): abre BitLocker
+  files/cryptsetup.static  cryptsetup estático, lo usa nb3-bitlocker; se
+                           genera con ./build-cryptsetup.sh
+  files/modules/KVER/dm-zero.ko
+                           módulo que el initrd no trae y el cryptsetup
+                           necesita, del kernel KVER del vmlinuz del pendrive;
+                           se baja con ./get-dm-zero.sh <pendrive>
+                           -> todo esto se empaqueta en nb3-staticip.cpio,
+                              con el ORDER del initrd
+  files/static-ip.conf     tabla MAC -> IP vacía -> se copia si falta
+  files/grub-block.cfg     bloque "IP fija" -> se inserta en grub.cfg
+
+nb3-staticip.cpio es un initrd extra que TODAS las entradas del grub.cfg
+cargan después de initrd.img (se agrega a cada línea initrd): BitLocker
+importa aunque no se use IP fija, y nb3-staticip no hace nada sin nbgw=, que
+solo pone la entrada "IP fija".
+
+BitLocker: nb3-bitlocker abre las particiones BitLocker que tienen la clave en
+claro (protección suspendida, o el cifrado "en espera" de los equipos nuevos)
+y las deja visibles como /dev/sdz0 para el NutellaBoot. Sin particiones
+BitLocker, o con nb3bitlocker=n en la línea del kernel, no hace nada. Riesgo:
+si Windows reactiva la protección (una actualización, manage-bde -resume), la
+clave en claro desaparece, la partición deja de abrirse y el NutellaBoot
+muestra NO DISK hasta que se vuelva a suspender la protección desde Windows.
 
 grub.cfg y nutellaboot.conf se EDITAN, no se reemplazan: cada pendrive trae
 su sede, su servidor y su NB_BOOT_KEY. static-ip.conf solo se toca si el TOML
@@ -40,7 +62,8 @@ trae [ips], y solo en las líneas de esas MACs.
 Se puede correr las veces que haga falta: lo que ya está igual no se toca, y
 antes de escribir muestra los cambios y pide confirmación. Hay que volver a
 correrlo cuando la autoactualización cambie initrd.img, porque el ORDER del
-overlay sale del ORDER de ese initrd, y lo reemplaza.
+overlay sale del ORDER de ese initrd, y lo reemplaza; y si cambió el kernel,
+hace falta el dm-zero.ko de la versión nueva (./get-dm-zero.sh).
 
 El sistema final necesita además, en el servidor,
 client/stuff/60-postmount.d/81-nm-static.sh (perfil del NetworkManager).
@@ -54,6 +77,7 @@ import lzma
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -62,15 +86,25 @@ from pathlib import Path
 
 FILES = Path(__file__).resolve().parent / "files"
 SRC_SCRIPT = FILES / "nb3-staticip"
+SRC_BITLOCKER = FILES / "nb3-bitlocker"
+SRC_CRYPTSETUP = FILES / "cryptsetup.static"
+SRC_MODULES = FILES / "modules"
 SRC_TABLE = FILES / "static-ip.conf"
 SRC_BLOCK = FILES / "grub-block.cfg"
 
 MARK_BEGIN = "# nb3-staticip inicio"
 MARK_END = "# nb3-staticip fin"
 CPIO_NAME = "nb3-staticip.cpio"
+# así va en las líneas initrd del grub.cfg
+CPIO_ARG = "/" + CPIO_NAME
 TABLE_NAME = "static-ip.conf"
 ORDER_PATH = "scripts/init-premount/ORDER"
 SCRIPT_PATH = "scripts/init-premount/nb3-staticip"
+BITLOCKER_PATH = "scripts/init-premount/nb3-bitlocker"
+# directorio propio de primer nivel: con usr-merge, usr/lib o bin del overlay
+# podrían pisar los symlinks del initrd
+CRYPTSETUP_PATH = "nb3/cryptsetup"
+MODULES_PATH = "nb3/modules"
 NET_KEYS = ("NB_NET_GW", "NB_NET_MASK", "NB_NET_DNS", "NB_NET_PREFIX")
 TOML_KEYS = ("gateway", "mascara", "dns", "prefijo")
 TOML_SECTIONS = ("red", "ips")
@@ -421,10 +455,37 @@ def first_entry(lines):
             continue
         m = re.match(r"^\s*initrd\s+(.*?)\s*$", line)
         if m and initrd is None:
-            initrd = m.group(1)
+            # sin el cpio: el bloque lo agrega él, y no tiene que ir dos veces
+            initrd = " ".join(w for w in m.group(1).split() if w != CPIO_ARG)
         if linux and initrd:
             break
     return title, linux, initrd
+
+
+def grub_with_cpio(text):
+    """Agrega /nb3-staticip.cpio a cada línea initrd de fuera de nuestro bloque
+    que no lo tenga. -> (texto, cuántas líneas cambian)."""
+    out = []
+    n = 0
+    inside = False
+    for line in text.splitlines(keepends=True):
+        if line.startswith(MARK_BEGIN):
+            inside = True
+        elif inside:
+            inside = not line.startswith(MARK_END)
+        else:
+            m = re.match(r"^(\s*initrd\s+)(.*?)(\s*)$", line)
+            if m and CPIO_ARG not in m.group(2).split():
+                line = f"{m.group(1)}{m.group(2)} {CPIO_ARG}{m.group(3)}"
+                n += 1
+        out.append(line)
+    return "".join(out), n
+
+
+def grub_initrds_ok(text):
+    """Toda línea initrd (dentro y fuera del bloque) carga el cpio."""
+    lines = [ln for ln in text.splitlines() if re.match(r"^\s*initrd\s", ln)]
+    return bool(lines) and all(CPIO_ARG in ln.split() for ln in lines)
 
 
 def grub_with_block(text, block):
@@ -458,16 +519,73 @@ def unified(old, new, name):
     return f"--- {name}\n" + "".join(body)
 
 
+def read_script(path):
+    script = path.read_bytes()
+    if not script.startswith(b"#!/bin/sh"):
+        raise Error(f"{path} no empieza con #!/bin/sh")
+    sh = shutil.which("sh")
+    if sh and subprocess.run([sh, "-n", str(path)]).returncode != 0:
+        raise Error(f"{path} tiene errores de sintaxis")
+    return script
+
+
+def check_static_elf(path, data):
+    """ELF x86_64 sin PT_INTERP: en el initrd no hay un ld.so con el que
+    cargarlo (un static-pie trae PT_DYNAMIC, pero no PT_INTERP, y sirve)."""
+    hint = "vuelve a generarlo con ./build-cryptsetup.sh"
+    if data[:4] != b"\x7fELF":
+        raise Error(f"{path} no es un ejecutable ELF; {hint}")
+    if len(data) < 64:
+        raise Error(f"{path} está truncado; {hint}")
+    # 64 bits, little endian, x86_64
+    if data[4] != 2 or data[5] != 1 or struct.unpack_from("<H", data, 0x12)[0] != 0x3E:
+        raise Error(f"{path} no es un ELF x86_64; {hint}")
+    phoff, = struct.unpack_from("<Q", data, 0x20)
+    phentsize, phnum = struct.unpack_from("<HH", data, 0x36)
+    if phoff + phentsize * phnum > len(data):
+        raise Error(f"{path} está truncado; {hint}")
+    for i in range(phnum):
+        if struct.unpack_from("<I", data, phoff + i * phentsize)[0] == 3:  # PT_INTERP
+            raise Error(f"{path} está enlazado dinámicamente (no arrancaría en el initrd); {hint}")
+
+
+def kernel_release(vmlinuz):
+    """La versión del kernel de un bzImage ("7.0.0-42-generic"): la cadena a
+    la que apunta kernel_version (0x20E) del setup header, más 0x200."""
+    with open(vmlinuz, "rb") as f:
+        head = f.read(0x10000)
+    if len(head) < 0x210 or head[0x202:0x206] != b"HdrS":
+        raise Error(f"{vmlinuz} no parece un kernel bzImage")
+    off = struct.unpack_from("<H", head, 0x20E)[0] + 0x200
+    ver = head[off:off + 256].split(b"\0")[0].split(b" ")[0].decode("ascii", "replace")
+    if not re.fullmatch(r"[0-9][\w.+~-]*", ver):
+        raise Error(f"no pude leer la versión del kernel de {vmlinuz}")
+    return ver
+
+
+def read_dm_zero(kver):
+    """files/modules/KVER/dm-zero.ko, comprobando que sea de ese kernel; None
+    si falta (sin él, BitLocker no abre: lo avisa plan)."""
+    ko = SRC_MODULES / kver / "dm-zero.ko"
+    if not ko.is_file():
+        return None
+    data = ko.read_bytes()
+    if not data.startswith(b"\x7fELF"):
+        raise Error(f"{ko} no es un módulo del kernel (¿quedó comprimido?); bájalo con ./get-dm-zero.sh")
+    if b"vermagic=" + kver.encode() + b" " not in data:
+        raise Error(f"{ko} no es del kernel {kver}; bájalo de nuevo con ./get-dm-zero.sh")
+    return data
+
+
 def read_sources():
-    for p in (SRC_SCRIPT, SRC_TABLE, SRC_BLOCK):
+    for p in (SRC_SCRIPT, SRC_BITLOCKER, SRC_TABLE, SRC_BLOCK):
         if not p.is_file():
             raise Error(f"falta {p}")
-    script = SRC_SCRIPT.read_bytes()
-    if not script.startswith(b"#!/bin/sh"):
-        raise Error(f"{SRC_SCRIPT} no empieza con #!/bin/sh")
-    sh = shutil.which("sh")
-    if sh and subprocess.run([sh, "-n", str(SRC_SCRIPT)]).returncode != 0:
-        raise Error(f"{SRC_SCRIPT} tiene errores de sintaxis")
+    if not SRC_CRYPTSETUP.is_file():
+        raise Error(f"falta {SRC_CRYPTSETUP}: se genera con ./build-cryptsetup.sh (en la raíz del repo)")
+    script, bitlocker = read_script(SRC_SCRIPT), read_script(SRC_BITLOCKER)
+    cryptsetup = SRC_CRYPTSETUP.read_bytes()
+    check_static_elf(SRC_CRYPTSETUP, cryptsetup)
     block = SRC_BLOCK.read_text()
     blines = block.rstrip("\n").splitlines()
     if not (blines and blines[0].startswith(MARK_BEGIN) and blines[-1].startswith(MARK_END)):
@@ -475,7 +593,7 @@ def read_sources():
     for ph in ("@TITLE@", "@LINUX@", "@INITRD@"):
         if ph not in block:
             raise Error(f"{SRC_BLOCK} no tiene {ph}")
-    return script, SRC_TABLE.read_bytes(), block.rstrip("\n") + "\n"
+    return script, bitlocker, cryptsetup, SRC_TABLE.read_bytes(), block.rstrip("\n") + "\n"
 
 
 def plan(args):
@@ -487,10 +605,8 @@ def plan(args):
             raise Error(f"{dest / f} no existe: ¿es la partición NB3CFG montada?")
     if not args.dry_run and not os.access(dest, os.W_OK):
         raise Error(f"{dest} no se puede escribir (¿montado como solo lectura?)")
-    if shutil.disk_usage(dest).free < 256 * 1024:
-        raise Error(f"no queda espacio libre en {dest}")
 
-    script, table_tpl, block_tpl = read_sources()
+    script, bitlocker, cryptsetup, table_tpl, block_tpl = read_sources()
     conf_path, grub_path = dest / "nutellaboot.conf", dest / "grub.cfg"
     cpio_path, table_path = dest / CPIO_NAME, dest / TABLE_NAME
     conf = conf_path.read_text(encoding="utf-8", errors="surrogateescape")
@@ -566,28 +682,55 @@ def plan(args):
     if re.search(r"(^|\s)ip=", linux):
         raise Error("la primera entrada de grub.cfg ya trae ip=; revisa el grub.cfg a mano")
     block = block_tpl.replace("@TITLE@", title).replace("@LINUX@", linux).replace("@INITRD@", initrd)
-    new_grub = grub_with_block(grub, block)
+    with_block = grub_with_block(grub, block)
+    # el cpio en todas las entradas: el BitLocker importa aunque no se use la IP
+    # fija, y sin nbgw= el nb3-staticip no hace nada
+    new_grub, ninitrd = grub_with_cpio(with_block)
     if new_grub == grub:
         p["report"].append(("grub.cfg", "ya estaba"))
     else:
-        p["report"].append(("grub.cfg", "se actualiza el bloque IP fija" if begins else "se agrega el bloque IP fija"))
+        done = []
+        if with_block != grub:
+            done.append("se actualiza el bloque IP fija" if begins else "se agrega el bloque IP fija")
+        if ninitrd:
+            done.append(f"{CPIO_ARG} en {ninitrd} líneas initrd")
+        p["report"].append(("grub.cfg", "; ".join(done)))
         p["writes"].append(("grub.cfg", new_grub.encode("utf-8", "surrogateescape"), True))
         p["diffs"].append(unified(grub, new_grub, "grub.cfg"))
 
-    # 3. nb3-staticip.cpio: el script de files/ + el ORDER del initrd
+    # 3. nb3-staticip.cpio: los scripts y el cryptsetup de files/ + el ORDER
+    # del initrd. Un script que el initrd ya trae en su ORDER no va en el
+    # overlay: correría dos veces.
     base = initrd_order(dest / "initrd.img")
-    if base and b"nb3-staticip" in base:
-        raise Error("el initrd.img ya trae nb3-staticip en su ORDER: no hace falta el overlay")
+    scripts = [("nb3-bitlocker", BITLOCKER_PATH, bitlocker), ("nb3-staticip", SCRIPT_PATH, script)]
+    builtin = [sc for sc in scripts
+               if base and re.search(rb"^/" + re.escape(sc[1].encode()) + rb"(?=\s|$)", base, re.M)]
+    if len(builtin) == len(scripts):
+        raise Error("el initrd.img ya trae nb3-bitlocker y nb3-staticip en su ORDER: no hace falta el overlay")
+    for name, _, _ in builtin:
+        warn(f"el initrd.img ya trae {name} en su ORDER: va el suyo, no el de files/")
+    scripts = [sc for sc in scripts if sc not in builtin]
     entries = [
         ("scripts", 0o040755, b""),
         ("scripts/init-premount", 0o040755, b""),
     ]
     if base:
-        order = base.rstrip(b"\n") + b'\n/scripts/init-premount/nb3-staticip "$@"\n' \
-            b"[ -e /conf/param.conf ] && . /conf/param.conf\n"
+        order = base.rstrip(b"\n") + b"\n" + b"".join(
+            f'/{path} "$@"\n'.encode() + b"[ -e /conf/param.conf ] && . /conf/param.conf\n"
+            for _, path, _ in scripts)
         entries.append((ORDER_PATH, 0o100644, order))
     # sin ORDER en el initrd, el initramfs-tools ordena solo por los prereqs
-    entries.append((SCRIPT_PATH, 0o100755, script))
+    entries += [(path, 0o100755, data) for _, path, data in scripts]
+    if any(name == "nb3-bitlocker" for name, _, _ in scripts):
+        entries += [("nb3", 0o040755, b""), (CRYPTSETUP_PATH, 0o100755, cryptsetup)]
+        kver = kernel_release(dest / "vmlinuz")
+        dm_zero = read_dm_zero(kver)
+        if dm_zero is None:
+            warn(f"falta {SRC_MODULES / kver / 'dm-zero.ko'}: sin él BitLocker no abre "
+                 f"(\"dm-zero module is missing\"); bájalo con ./get-dm-zero.sh {dest}")
+        else:
+            entries += [(MODULES_PATH, 0o040755, b""), (f"{MODULES_PATH}/{kver}", 0o040755, b""),
+                        (f"{MODULES_PATH}/{kver}/dm-zero.ko", 0o100644, dm_zero)]
     want = {n: (m, d) for n, m, d in entries}
     have = None
     if cpio_path.is_file():
@@ -602,14 +745,30 @@ def plan(args):
     if have == want:
         p["report"].append((CPIO_NAME, "ya estaba"))
     else:
-        p["report"].append((CPIO_NAME, "se crea" if have is None else "se actualiza (script u ORDER distintos)"))
-        p["writes"].append((CPIO_NAME, cpio_build(entries), False))
+        if have is None:
+            p["report"].append((CPIO_NAME, "se crea"))
+        else:
+            changed = sorted(n for n in want.keys() | have.keys() if want.get(n) != have.get(n))
+            p["report"].append((CPIO_NAME, "se actualiza: " + ", ".join(changed)))
+        data = cpio_build(entries)
+        p["writes"].append((CPIO_NAME, data, False))
         nscripts = sum(ln.startswith(b"/scripts") for ln in (base or b"").splitlines())
         p["diffs"].append(
-            f"--- {CPIO_NAME} (contenido)\n  {ORDER_PATH}\n  {SCRIPT_PATH}\n"
-            + (f"  ORDER = el de initrd.img ({nscripts} scripts) + nb3-staticip\n" if base else "")
+            f"--- {CPIO_NAME} (contenido, {len(data) // 1024} KiB)\n"
+            + "".join(f"  {n}" + ("/" if m & 0o040000 else f" ({len(d) // 1024} KiB)" if len(d) >= 1 << 20 else "")
+                      + "\n" for n, m, d in entries)
+            + (f"  ORDER = el de initrd.img ({nscripts} scripts) + "
+               + " + ".join(name for name, _, _ in scripts) + "\n" if base else "")
         )
     p["want_cpio"] = want
+
+    # espacio: cada archivo se escribe a un temporal antes de reemplazar el
+    # viejo (install), así que el cpio nuevo entero tiene que caber junto al
+    # que está; más las copias .bak y un margen
+    need = 256 * 1024 + sum(len(d) + ((dest / n).stat().st_size if bak else 0) for n, d, bak in p["writes"])
+    free = shutil.disk_usage(dest).free
+    if free < need:
+        raise Error(f"no queda espacio libre en {dest}: hacen falta {need // 1024} KiB y hay {free // 1024} KiB")
 
     # 4. static-ip.conf: sin [ips] se revisa y no se toca; con [ips] se
     # fusiona, y solo cambian las líneas de esas MACs
@@ -746,8 +905,11 @@ def verify(p):
     conf = (dest / "nutellaboot.conf").read_text(encoding="utf-8", errors="replace")
     if conf_get(conf, "NB_NET_GW") != p["net"][0]:
         fails.append("NB_NET_GW en nutellaboot.conf")
-    if "--id staticip" not in (dest / "grub.cfg").read_text(encoding="utf-8", errors="replace"):
+    grub = (dest / "grub.cfg").read_text(encoding="utf-8", errors="replace")
+    if "--id staticip" not in grub:
         fails.append("el bloque IP fija en grub.cfg")
+    if not grub_initrds_ok(grub):
+        fails.append(f"{CPIO_ARG} en todas las líneas initrd de grub.cfg")
     with open(dest / CPIO_NAME, "rb") as f:
         got = cpio_read(f)
     for n, (m, d) in p["want_cpio"].items():
@@ -763,7 +925,8 @@ def verify(p):
 
 def main():
     ap = argparse.ArgumentParser(
-        description='Instala la entrada "IP fija" (salas sin DHCP) en un pendrive NutellaBoot 3.')
+        description='Instala la entrada "IP fija" (salas sin DHCP) y el soporte de BitLocker con clave '
+                    'en claro en un pendrive NutellaBoot 3.')
     ap.add_argument("dest", help="la partición NB3CFG del pendrive, montada (ej.: /mnt/nb3)")
     ap.add_argument("toml", help="la red de la sala: sección [red] con gateway, mascara, dns, prefijo; "
                     "y, opcional, [ips] con MAC = IP")
@@ -819,6 +982,8 @@ def main():
     print("  - En el servidor, client/stuff/60-postmount.d/81-nm-static.sh (sin él, el")
     print("    escritorio queda sin red).")
     print('  - Probar en una máquina: el menú debe arrancar en "IP fija" y pedir la IP.')
+    print("  - BitLocker: si Windows reactiva la protección, la partición deja de abrirse")
+    print("    y aparece NO DISK; hay que volver a suspenderla desde Windows.")
     print("  - Volver a correr este script cuando la autoactualización cambie initrd.img.")
     return 0
 

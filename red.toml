@@ -1,6 +1,9 @@
 # Red cableada de este computador (enp8s0, 172.17.68.69/26), DCC UChile.
 # El prefijo (172.17.68.) se deduce del gateway y la máscara.
 [red]
-gateway = "172.17.68.65"
-mascara = "255.255.255.192"
-dns     = ["172.17.68.40", "172.17.68.36"]
+gateway = "172.17.40.1"
+mascara = "255.255.254.0"
+dns     = ["172.17.40.9", "172.17.66.9"]
+
+[ips]
+"08:8f:c3:b6:5c:9f" = "172.17.40.243"

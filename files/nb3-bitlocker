@@ -1,0 +1,298 @@
+#!/bin/sh
+# nb3-bitlocker — abre el C: de Windows cifrado con BitLocker con la protección
+# suspendida ("clear key": la clave queda en claro en el disco; Windows dice
+# "Protección desactivada"), para que el nutellaboot pueda guardar el sistema
+# ahí. Viene en un cpio extra que el grub.cfg carga después de initrd.img.
+#
+# Corre en init-premount: después del udev y antes del mountroot del
+# nutellaboot. Recorre los mismos discos que nutella_findblock (30-storage.sh
+# del stuff); cada partición BitLocker la abre con el cryptsetup estático de
+# /nb3 (el 2.7 del initrd rechaza la clear key; hace falta >= 2.8.2) como
+# /dev/mapper/nb3bitlk<N>, en lectura-escritura, y le hace un nodo de bloque
+# /dev/sdz0 (si hay más, /dev/sdy0, /dev/sdx0...) para que el glob /dev/sd??
+# de nutella_findblock lo vea como un NTFS más. La partición 0 nunca la crea
+# el kernel, así que el nombre no choca con discos reales.
+#
+# Con la protección activa (TPM, PIN, contraseña) no se puede abrir: lo avisa
+# y sigue; nutella_findblock la descarta como siempre. También en
+# factoryreset=y abre, para que el nutellaboot pueda borrar su carpeta.
+# Con nb3bitlocker=n en la línea del kernel no hace nada. Se puede correr dos
+# veces: lo ya abierto se reusa.
+#
+# El registro ($NB_RUN/bitlocker, con lo que se ve de los discos) se copia
+# además al pendrive como nb3-bitlocker.log: la pantalla NO DISK reinicia la
+# máquina y no deja otra forma de saber qué pasó aquí.
+
+PREREQ="udev"
+prereqs() { echo "$PREREQ"; }
+case "${1:-}" in
+    prereqs)
+        prereqs
+        exit 0
+        ;;
+esac
+
+# rutas parametrizadas para poder probarlo fuera del initramfs
+NB_RUN=${NB_RUN:-/run/nutellaboot}
+NBB_CMDLINE=${NBB_CMDLINE:-/proc/cmdline}
+NBB_CONSOLE=${NBB_CONSOLE:-/dev/console}
+NBB_CRYPTSETUP=${NBB_CRYPTSETUP:-/nb3/cryptsetup}
+# módulos que el initrd no trae, por versión del kernel (los pone el cpio)
+NBB_MODDIR=${NBB_MODDIR:-/nb3/modules}
+NBB_SYS_MODULE=${NBB_SYS_MODULE:-/sys/module}
+NBB_BLKID=${NBB_BLKID:-/sbin/blkid}
+NBB_DEV=${NBB_DEV:-/dev}
+NBB_SYS_BLOCK=${NBB_SYS_BLOCK:-/sys/block}
+NBB_TIMEOUT=${NBB_TIMEOUT:-5}
+NBB_BYUUID=${NBB_BYUUID:-/dev/disk/by-uuid}
+NBB_BYLABEL=${NBB_BYLABEL:-/dev/disk/by-label/NB3CFG}
+NBB_MNT=${NBB_MNT:-/mnt/nb3bitlocker}
+# NBB_CFGDIR: un directorio que hace de FAT, sin montar nada (pruebas)
+NBB_CFGDIR=${NBB_CFGDIR:-}
+# pausa tras un mensaje en consola, para que se alcance a leer
+NBB_PAUSE=${NBB_PAUSE:-3}
+NBB_LOG=$NB_RUN/bitlocker
+NBB_USBLOG=nb3-bitlocker.log
+
+# a consola, en inglés como todo lo del boot; el registro lleva lo mismo
+said=""
+say() {
+    printf 'nb3-bitlocker: %s\n' "$*" >> "$NBB_CONSOLE"
+    log "$*"
+    said=1
+}
+log() { printf '%s\n' "$*" >> "$NBB_LOG" 2> /dev/null; }
+
+# --- parámetros -------------------------------------------------------------
+
+set -f
+read -r _cmdline < "$NBB_CMDLINE"
+cfg=""
+for _t in $_cmdline; do
+    case "$_t" in
+        nb3bitlocker=n) exit 0 ;;
+        nb3cfg=*) cfg=${_t#nb3cfg=} ;;
+    esac
+done
+set +f
+
+# --- el registro en el pendrive -------------------------------------------------
+
+# lo que se ve de los discos, para entender después un NO DISK
+diagnose() {
+    log "--- kernel $(uname -r 2> /dev/null); $("$NBB_CRYPTSETUP" --version 2> /dev/null)"
+    log "--- discos"
+    for _dg_d in "$NBB_DEV"/nvme*n*p* "$NBB_DEV"/sd?? "$NBB_DEV"/vd?? "$NBB_DEV"/mmcblk*p*; do
+        [ -e "$_dg_d" ] || continue
+        log "$_dg_d: $("$NBB_BLKID" --probe -o export "$_dg_d" 2> /dev/null | grep -E '^(TYPE|LABEL|VERSION)=' | tr '\n' ' ')"
+    done
+    log "--- dm"
+    for _dg_k in "$NBB_SYS_BLOCK"/dm-*; do
+        [ -e "$_dg_k" ] || continue
+        # shellcheck disable=SC2012 # nombres dm-K y de discos, sin espacios
+        log "${_dg_k##*/}: $(cat "$_dg_k/dm/name" 2> /dev/null) $(cat "$_dg_k/dev" 2> /dev/null) slaves: $(ls "$_dg_k/slaves" 2> /dev/null | tr '\n' ' ')"
+    done
+    log "--- módulos"
+    log "$(grep -E '^(dm_crypt|dm_zero|dm_mod|vmd|nvme|ahci) ' /proc/modules 2> /dev/null | cut -d' ' -f1 | tr '\n' ' ')"
+    log "--- dmesg"
+    log "$(dmesg 2> /dev/null | grep -iE 'device-mapper|dm-crypt|crypt|bitlk|vmd|nvme' | tail -n 30)"
+}
+
+cfg_device() {
+    if [ -n "$cfg" ]; then
+        _cd_u=$(printf '%s' "$cfg" | tr 'a-f' 'A-F')
+        [ -e "$NBB_BYUUID/$_cd_u" ] && readlink -f "$NBB_BYUUID/$_cd_u" && return 0
+    fi
+    [ -e "$NBB_BYLABEL" ] && readlink -f "$NBB_BYLABEL" && return 0
+    return 1
+}
+
+# copia el registro a la FAT del pendrive (si está y se puede escribir)
+save_log() {
+    if [ -n "$NBB_CFGDIR" ]; then
+        cp "$NBB_LOG" "$NBB_CFGDIR/$NBB_USBLOG" 2> /dev/null
+        return 0
+    fi
+    # el pendrive puede aparecer tarde, como espera también nb3-staticip
+    _sl_t=0
+    until _sl_dev=$(cfg_device); do
+        _sl_t=$((_sl_t + 1))
+        if [ "$_sl_t" -ge 10 ]; then
+            say "the NB3CFG partition was not found: $NBB_USBLOG not saved"
+            return 0
+        fi
+        command -v udevadm > /dev/null 2>&1 && udevadm settle --timeout=1 > /dev/null 2>&1
+        sleep 1
+    done
+    modprobe -q vfat 2> /dev/null
+    mkdir -p "$NBB_MNT"
+    if ! mount -t vfat -o rw "$_sl_dev" "$NBB_MNT" 2> /dev/null; then
+        say "could not mount $_sl_dev read-write: $NBB_USBLOG not saved"
+        return 0
+    fi
+    cp "$NBB_LOG" "$NBB_MNT/$NBB_USBLOG" 2> /dev/null
+    sync
+    umount "$NBB_MNT" 2> /dev/null
+}
+
+finish() {
+    diagnose
+    save_log
+    [ -n "$said" ] && sleep "$NBB_PAUSE"
+    exit 0
+}
+
+mkdir -p "$NB_RUN" 2> /dev/null
+: > "$NBB_LOG" 2> /dev/null
+log "nb3-bitlocker: $_cmdline"
+if [ ! -x "$NBB_CRYPTSETUP" ]; then
+    log "no $NBB_CRYPTSETUP: nothing done"
+    save_log
+    exit 0
+fi
+
+# --- discos -------------------------------------------------------------------
+
+# los drivers que pueden estar debajo del C: (VMD/RST, NVMe, SATA) y dm-crypt;
+# el que no esté o falle, se ignora
+for _m in vmd nvme ahci sd_mod dm_mod dm_crypt; do
+    modprobe -q "$_m" 2> /dev/null
+done
+# dm-zero: el cryptsetup tapa con él las zonas de metadatos de BitLocker, y el
+# initrd del NutellaBoot no lo trae ("kernel dm-zero module is missing"); va
+# en el cpio, sacado del paquete linux-modules de ese mismo kernel
+if [ ! -d "$NBB_SYS_MODULE/dm_zero" ] && ! modprobe -q dm_zero 2> /dev/null; then
+    _ko=$NBB_MODDIR/$(uname -r)/dm-zero.ko
+    if [ ! -f "$_ko" ]; then
+        log "no $_ko: BitLocker cannot be opened"
+    elif ! insmod "$_ko" >> "$NBB_LOG" 2>&1; then
+        log "insmod $_ko failed"
+    fi
+fi
+command -v udevadm > /dev/null 2>&1 &&
+    udevadm settle --timeout="$NBB_TIMEOUT" > /dev/null 2>&1
+
+# --- device-mapper ------------------------------------------------------------
+
+# dm_of <dev>: el dm-K (de este script) que ya tiene abierto <dev>
+dm_of() {
+    for _do_d in "$NBB_SYS_BLOCK"/dm-*; do
+        [ -e "$_do_d/slaves/${1##*/}" ] || continue
+        case "$(cat "$_do_d/dm/name" 2> /dev/null)" in
+            nb3bitlk*)
+                echo "${_do_d##*/}"
+                return 0
+                ;;
+        esac
+    done
+    return 1
+}
+
+# dm_named <nombre>: el dm-K con ese nombre
+dm_named() {
+    for _dn_d in "$NBB_SYS_BLOCK"/dm-*; do
+        [ "$(cat "$_dn_d/dm/name" 2> /dev/null)" = "$1" ] || continue
+        echo "${_dn_d##*/}"
+        return 0
+    done
+    return 1
+}
+
+# free_name: el primer nb3bitlk<N> libre
+free_name() {
+    _fn_n=0
+    while dm_named "nb3bitlk$_fn_n" > /dev/null || [ -e "$NBB_DEV/mapper/nb3bitlk$_fn_n" ]; do
+        _fn_n=$((_fn_n + 1))
+    done
+    echo "nb3bitlk$_fn_n"
+}
+
+# devno <nombre>: major:minor del volumen abierto (sysfs; si no, dmsetup)
+devno() {
+    _dv_k=$(dm_named "$1") && cat "$NBB_SYS_BLOCK/$_dv_k/dev" 2> /dev/null && return 0
+    dmsetup info -c --noheadings -o major,minor "$1" 2> /dev/null | tr -d ' '
+}
+
+# --- nodos /dev/sdX0 ----------------------------------------------------------
+
+# node_devno <ruta>: major:minor del nodo de bloque <ruta>
+node_devno() {
+    # shellcheck disable=SC2012 # el ls muestra major, minor; el find del busybox no
+    ls -lnL "$1" 2> /dev/null | awk '/^b/ { sub(/,$/, "", $5); print $5 ":" $6 }'
+}
+
+# make_node <major:minor>: el /dev/sd?0 de ese volumen; reusa el que ya hay
+# y no pisa nada que no sea suyo
+make_node() {
+    _mn_letters="z y x w v u t s r q p o n m l k j i h g f e d c b a"
+    for _mn_l in $_mn_letters; do
+        _mn_p=$NBB_DEV/sd${_mn_l}0
+        [ -e "$_mn_p" ] && [ "$(node_devno "$_mn_p")" = "$1" ] && echo "$_mn_p" && return 0
+    done
+    for _mn_l in $_mn_letters; do
+        _mn_p=$NBB_DEV/sd${_mn_l}0
+        if [ -e "$_mn_p" ]; then
+            log "$_mn_p already exists ($(node_devno "$_mn_p")): skipped"
+            continue
+        fi
+        # como cualquier disco: root:disk 0660. Sin -m quedaría 0644 (umask
+        # 022 del initrd), y cualquier usuario del escritorio podría leer el
+        # C: ya descifrado
+        mknod -m 0660 "$_mn_p" b "${1%%:*}" "${1#*:}" 2>> "$NBB_LOG" || return 1
+        chgrp disk "$_mn_p" 2> /dev/null
+        echo "$_mn_p"
+        return 0
+    done
+    return 1
+}
+
+# --- abrir ----------------------------------------------------------------------
+
+# unlock <dev>: abre <dev> con la clear key (cualquier clave sirve: el slot
+# de la clear key se prueba siempre) y deja el nodo
+unlock() {
+    if _ul_k=$(dm_of "$1"); then
+        _ul_name=$(cat "$NBB_SYS_BLOCK/$_ul_k/dm/name")
+        _ul_how="already unlocked"
+    else
+        _ul_name=$(free_name)
+        log "$1: $NBB_CRYPTSETUP open --type bitlk $1 $_ul_name"
+        if ! printf x | "$NBB_CRYPTSETUP" open --type bitlk --key-file=- "$1" "$_ul_name" >> "$NBB_LOG" 2>&1; then
+            # el motivo, del encabezado: sin clear key está protegido
+            _ul_dump=$("$NBB_CRYPTSETUP" bitlkDump "$1" 2>&1)
+            log "$_ul_dump"
+            if printf '%s\n' "$_ul_dump" | grep -qi 'clear key'; then
+                say "BitLocker on $1: has a clear key but could not be opened (see $NBB_LOG)"
+            else
+                say "BitLocker on $1: protected, cannot be opened - turn BitLocker off in Windows"
+            fi
+            return 1
+        fi
+        command -v udevadm > /dev/null 2>&1 &&
+            udevadm settle --timeout="$NBB_TIMEOUT" > /dev/null 2>&1
+        _ul_how="unlocked (clear key)"
+    fi
+    _ul_no=$(devno "$_ul_name")
+    if [ -z "$_ul_no" ]; then
+        say "BitLocker on $1: $_ul_how as $_ul_name, but its device number was not found"
+        return 1
+    fi
+    if ! _ul_node=$(make_node "$_ul_no"); then
+        say "BitLocker on $1: $_ul_how as $_ul_name, but no free /dev/sd?0 name for it"
+        return 1
+    fi
+    say "BitLocker on $1: $_ul_how as $_ul_node"
+    log "$_ul_node: $("$NBB_BLKID" --probe -o export "$_ul_node" 2> /dev/null | grep -E '^(TYPE|LABEL)=' | tr '\n' ' ')"
+}
+
+# los mismos globs que nutella_findblock
+found=""
+for _d in "$NBB_DEV"/nvme*n*p* "$NBB_DEV"/sd?? "$NBB_DEV"/vd?? "$NBB_DEV"/mmcblk*p*; do
+    [ -e "$_d" ] || continue
+    case "$_d" in "$NBB_DEV"/sd?0) continue ;; esac
+    [ "$("$NBB_BLKID" --probe -s TYPE -o value "$_d" 2> /dev/null)" = BitLocker ] || continue
+    found=1
+    unlock "$_d"
+done
+[ -n "$found" ] || log "no BitLocker partition found"
+finish
